@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# ena-agent — ExtraNodeAccess 中转 VPS 通信脚本 (v2.0 M2)
+# ena-agent — ExtraNodeAccess 中转 VPS 通信脚本 (v2.1 全量同步)
 #
-# 从面板拉取 Mieru 期望状态，调用 nobrand mieru CLI 幂等收敛本机用户，
-# 并回报执行结果。面板是唯一事实源；本脚本除显式 deleted 外不删除用户。
+# 面板生成完整配置表 → 本脚本拉取后合并进本机 users.json →
+# 一条 `nobrand mieru --user-restore` 应用全部用户（含 tc 限速）。
+# 语义：缺的创建、多的删除、参数变化自动更新。面板是唯一事实源。
 #
 # 配置文件 /etc/ena-agent.conf:
 #   ENA_URL="https://面板域名/api/v2/ena-agent/v1"
@@ -30,6 +31,7 @@ exec 9>"$LOCK" || exit 1
 flock -n 9 || { log "已有实例在运行，跳过"; exit 0; }
 
 command -v jq >/dev/null || { log "缺少 jq：apt-get install -y jq"; exit 1; }
+command -v python3 >/dev/null || { log "缺少 python3"; exit 1; }
 command -v "$ENA_NOBRAND" >/dev/null || { log "缺少 $ENA_NOBRAND（NoBrand-OneClick）"; exit 1; }
 
 log "=== 开始拉取期望状态 ==="
@@ -40,21 +42,12 @@ STATUS=$(printf '%s' "$RESP" | jq -r '.status // empty' 2>/dev/null)
 [ "$STATUS" = "success" ] || { log "面板返回异常: $(printf '%s' "$RESP" | head -c 200)"; exit 1; }
 
 ADV_HOST_DEFAULT=$(printf '%s' "$RESP" | jq -r '.data.node.advertise_host // empty')
-[ -n "${ENA_ADV_HOST:-}" ] && ADV_HOST_DEFAULT="$ENA_ADV_HOST"
+[ -n "${ENA_ADV_HOST:-}" ] && ADV_HOST_DEFAULT="$ADV_HOST_DEFAULT"
 
 VERSION=$(printf '%s' "$RESP" | jq -r '.data.version // ""')
 
-# 本机现状：用户名 -> 端口（nobrand 用户表第二列）
-USERS_TABLE=$(timeout 30 "$ENA_NOBRAND" mieru --users 2>/dev/null || true)
-user_port() { printf '%s' "$USERS_TABLE" | awk -v u="$1" '$1==u {print $2; exit}'; }
-
-APPLIED='[]'; DISABLED='[]'; ERRORS='[]'; DELETED='[]'
-N_OK=0; N_DIS=0; N_ERR=0; N_DEL=0
 LOCAL_JSON="/var/lib/nobrand-oneclick/mieru/users.json"
 [ -r "$LOCAL_JSON" ] || { log "本机 users.json 不存在: $LOCAL_JSON"; exit 1; }
-
-# ---- 合并前的本机用户名快照（孤儿对照用，读文件不依赖 nobrand 锁） ----
-LOCAL_NAMES_BEFORE=$(jq -r '.users[]?.name' "$LOCAL_JSON" 2>/dev/null | sort || true)
 
 # ---- 期望配置表落盘 ----
 TABLE_FILE=$(mktemp /tmp/ena-table.XXXXXX)
@@ -63,99 +56,89 @@ jq -e '.users | type == "array"' "$TABLE_FILE" >/dev/null 2>&1 || {
     log "期望配置表解析失败"; rm -f "$TABLE_FILE"; exit 1;
 }
 
-# ---- 合并: 期望表 + 本机现状 → 新 users.json ----
-#  已有用户: 保留 instance_id / ingress 等本机字段, 更新核心字段
-#  新用户:   instance_id 按用户名生成, ingress 字段克隆本机首个用户
-#  本机多出的 ena* 用户: 不进入新配置 (restore 覆盖后自动消失)
+REPORT_FILE=$(mktemp /tmp/ena-report.XXXXXX)
 NEW_LOCAL=$(mktemp /tmp/ena-users.XXXXXX.json)
-log "jq 版本: $(jq --version 2>&1)"
-jq --slurpfile loc "$LOCAL_JSON" --slurpfile tbl "$TABLE_FILE" '
-  ($tbl[0]) as $t
-  | $loc[0] as $L
-  | ($L.users | map({key:.name, value:.}) | from_entries) as $lm
-  | ($L.users[0] // null) as $tpl
-  | ($L | .users = [
-      $t.users[] | . as $u |
-      (if $lm[$u.name] then
-         ($lm[$u.name] * {
-            password: $u.password,
-            port: $u.port,
-            advertise_host: $t.advertise_host,
-            advertise_port: $u.port,
-            enabled: $u.enabled,
-            quota_mb: $u.quota_mb,
-            quota_days: $u.quota_days,
-            expire_at: $u.expire_at,
-            bandwidth_mbps: $u.bandwidth_mbps,
-            updated_at: (now|floor)
-         })
-       else
-         (($tpl // {}) * {
-            instance_id: ("u" + ($u.name | @base64 | gsub("[^a-zA-Z0-9]";"") | .[0:16])),
-            name: $u.name,
-            password: $u.password,
-            port: $u.port,
-            advertise_host: $t.advertise_host,
-            advertise_port: $u.port,
-            enabled: $u.enabled,
-            quota_mb: $u.quota_mb,
-            quota_days: $u.quota_days,
-            quota_mode: "rolling",
-            last_quota_reset: "",
-            expire_at: $u.expire_at,
-            package: "unlimited",
-            bandwidth_mbps: $u.bandwidth_mbps,
-            created_at: (now|floor),
-            updated_at: (now|floor)
-         })
-       end)
-    ]) | sort_by(.port)
-  ' > "$NEW_LOCAL" 2>>"$LOG" || {
-    log "jq 合并失败"; rm -f "$TABLE_FILE" "$NEW_LOCAL"; exit 1;
+# Python 合并: 期望配置表 + 本机现状 → 新 users.json + 回报数据
+#  已有用户保留 instance_id / ingress / created_at 等本机字段;
+#  新用户生成 instance_id 并克隆本机首个用户作模板;
+#  本机多出的 ena* 用户不进入新配置 (restore 覆盖后自动消失)
+python3 - "$LOCAL_JSON" "$TABLE_FILE" "$NEW_LOCAL" "$REPORT_FILE" << 'ENA_PY'
+import json, sys, time, hashlib
+
+loc_path, tbl_path, out_path, rep_path = sys.argv[1:5]
+loc = json.load(open(loc_path))
+tbl = json.load(open(tbl_path))
+lmap = {u["name"]: u for u in loc.get("users", [])}
+users_old = [u["name"] for u in loc.get("users", [])]
+now = int(time.time())
+applied, disabled, deleted = [], [], []
+out_users = []
+tpl = loc["users"][0] if loc.get("users") else {
+    "ingress_profile_id": "legacy-default-route",
+    "ingress_enforcement": "permissive",
+    "ingress_enforcement_method": "wildcard",
+    "ingress_local_address": "",
 }
+for u in tbl.get("users", []):
+    name = u["name"]
+    base = lmap.get(name)
+    if base is None:
+        base = dict(tpl) if isinstance(tpl, dict) else {}
+        base["instance_id"] = "u" + hashlib.md5(name.encode()).hexdigest()[:16]
+        base.setdefault("quota_mode", "rolling")
+        base.setdefault("last_quota_reset", "")
+        base.setdefault("package", "unlimited")
+        base.setdefault("created_at", now)
+    base.update({
+        "name": name,
+        "password": u["password"],
+        "port": u["port"],
+        "advertise_host": tbl.get("advertise_host", ""),
+        "advertise_port": u["port"],
+        "enabled": bool(u["enabled"]),
+        "quota_mb": u.get("quota_mb", 0),
+        "quota_days": u.get("quota_days", 30),
+        "expire_at": u.get("expire_at", ""),
+        "bandwidth_mbps": u.get("bandwidth_mbps", 0),
+        "updated_at": now,
+    })
+    out_users.append(base)
+    (applied if u["enabled"] else disabled).append(name)
+
+loc["users"] = sorted(out_users, key=lambda x: x.get("port", 0))
+json.dump(loc, open(out_path, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+
+desired_names = {u["name"] for u in tbl.get("users", [])}
+for name in users_old:
+    if name.startswith("ena") and name not in desired_names:
+        deleted.append(name)
+
+json.dump({"applied": applied, "disabled": disabled, "deleted": deleted},
+          open(rep_path, "w", encoding="utf-8"), ensure_ascii=False)
+ENA_PY
+
+[ -s "$REPORT_FILE" ] || { log "Python 合并失败"; rm -f "$TABLE_FILE" "$NEW_LOCAL" "$REPORT_FILE"; exit 1; }
 jq -e '.users | type == "array"' "$NEW_LOCAL" >/dev/null 2>&1 || {
-    log "合并结果校验失败"; rm -f "$TABLE_FILE" "$NEW_LOCAL"; exit 1;
+    log "合并结果校验失败"; rm -f "$TABLE_FILE" "$NEW_LOCAL" "$REPORT_FILE"; exit 1;
 }
 
-# ---- 统计差异用于回报 ----
-APPLIED=$(jq -r --slurpfile loc "$LOCAL_JSON" '
-    ($loc[0].users | map(.name)) as $old
-    | [.users[] | select(.enabled == true) | .name | select(. as $n | $old | index($n) | not)]' "$NEW_LOCAL" | jq -s '.[0]')
-DISABLED=$(jq -r '[.users[] | select(.enabled == false) | .name]' "$NEW_LOCAL" | jq -s .[0])
-DELETED=$(jq -r --slurpfile loc "$LOCAL_JSON" '
-    ($loc[0].users | map(.name)) as $old
-    | [.users[]?.name] as $new
-    | [$old[] | select(. as $n | ($new | index($n)) | not)]' "$NEW_LOCAL" | jq -s '.[0]' 2>/dev/null || printf '[]')
-N_OK=$(printf '%s' "$APPLIED" | jq 'length')
-N_DIS=$(printf '%s' "$DISABLED" | jq 'length')
-N_DEL=$(printf '%s' "$DELETED" | jq 'length')
+APPLIED=$(jq -c '.applied' "$REPORT_FILE")
+DISABLED=$(jq -c '.disabled' "$REPORT_FILE")
+DELETED=$(jq -c '.deleted' "$REPORT_FILE")
+N_OK=$(jq '.applied | length' "$REPORT_FILE")
+N_DIS=$(jq '.disabled | length' "$REPORT_FILE")
+N_DEL=$(jq '.deleted | length' "$REPORT_FILE")
 
-# ---- 备份 + 一次性应用 ----
 cp "$LOCAL_JSON" "$LOCAL_JSON.bak.$(date +%s)" 2>/dev/null
-log "应用配置表: 保留/新增 $(jq ".users | length" "$NEW_LOCAL") 用户, 生效 $N_OK, 停用 $N_DIS, 移除 $N_DEL"
-if ! "$ENA_NOBRAND" timeout 300 mieru --user-restore "$NEW_LOCAL" >>"$LOG" 2>&1; then
+log "应用配置表: 保留/新增 $(jq '.users | length' "$NEW_LOCAL") 用户, 生效 $N_OK, 停用 $N_DIS, 移除 $N_DEL"
+if ! timeout 300 "$ENA_NOBRAND" mieru --user-restore "$NEW_LOCAL" >>"$LOG" 2>&1; then
     ERRORS=$(printf '%s' "$ERRORS" | jq '. + [{username:"restore",message:"user-restore 失败, 详见日志"}]')
     N_ERR=1; log "❌ user-restore 失败 (已保留备份)"
 else
     log "✅ user-restore 应用成功"
 fi
 
-rm -f "$TABLE_FILE" "$NEW_LOCAL"
-
-# ---- 全量对账：删除合并前存在、但期望表中没有的 ena 前缀孤儿用户 ----
-DESIRED_NAMES=$(printf '%s' "$RESP" | jq -r '.data.table.users[]?.name' | sort)
-while read -r LU; do
-    [ -z "$LU" ] && continue
-    case "$LU" in ena*) ;; *) continue ;; esac
-    if ! printf '%s\n' "$DESIRED_NAMES" | grep -qxF "$LU"; then
-        if timeout 60 "$ENA_NOBRAND" mieru --user-del "$LU" -y >>"$LOG" 2>&1; then
-            DELETED=$(printf '%s' "$DELETED" | jq --arg u "$LU" '. + [$u]')
-            N_DEL=$((N_DEL+1)); log "移除多余用户: $LU"
-        else
-            log "移除失败: $LU（下轮重试）"
-        fi
-    fi
-done < <(printf '%s\n' "$LOCAL_NAMES_BEFORE")
+rm -f "$TABLE_FILE" "$NEW_LOCAL" "$REPORT_FILE"
 
 # ---- 回报 ----
 BODY=$(jq -n --argjson a "$APPLIED" --argjson d "$DISABLED" --argjson e "$ERRORS" --argjson x "$DELETED" \
@@ -164,4 +147,4 @@ RESP2=$(curl "${CURL_OPTS[@]}" -X POST -H "Authorization: Bearer $ENA_TOKEN" \
     -H "X-ENA-Node: $ENA_NODE" -H "Content-Type: application/json" \
     -d "$BODY" "$ENA_URL/report" 2>&1) || RESP2="report-failed"
 
-log "=== 完成: 生效 $N_OK, 停用 $N_DIS, 删除 $N_DEL, 失败 $N_ERR | report: $(printf '%s' "$RESP2" | head -c 120) ==="
+log "=== 完成: 生效 $N_OK, 停用 $N_DIS, 移除 $N_DEL, 失败 $N_ERR | report: $(printf '%s' "$RESP2" | head -c 120) ==="
