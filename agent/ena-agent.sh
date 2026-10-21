@@ -53,6 +53,9 @@ N_OK=0; N_DIS=0; N_ERR=0; N_DEL=0
 LOCAL_JSON="/var/lib/nobrand-oneclick/mieru/users.json"
 [ -r "$LOCAL_JSON" ] || { log "本机 users.json 不存在: $LOCAL_JSON"; exit 1; }
 
+# ---- 合并前的本机用户名快照（孤儿对照用，读文件不依赖 nobrand 锁） ----
+LOCAL_NAMES_BEFORE=$(jq -r '.users[]?.name' "$LOCAL_JSON" 2>/dev/null | sort || true)
+
 # ---- 期望配置表落盘 ----
 TABLE_FILE=$(mktemp /tmp/ena-table.XXXXXX)
 printf '%s' "$RESP" | jq '.data.table' > "$TABLE_FILE" 2>/dev/null
@@ -138,6 +141,21 @@ else
 fi
 
 rm -f "$TABLE_FILE" "$NEW_LOCAL"
+
+# ---- 全量对账：删除合并前存在、但期望表中没有的 ena 前缀孤儿用户 ----
+DESIRED_NAMES=$(printf '%s' "$RESP" | jq -r '.data.table.users[]?.name' | sort)
+while read -r LU; do
+    [ -z "$LU" ] && continue
+    case "$LU" in ena*) ;; *) continue ;; esac
+    if ! printf '%s\n' "$DESIRED_NAMES" | grep -qxF "$LU"; then
+        if timeout 60 "$ENA_NOBRAND" mieru --user-del "$LU" -y >>"$LOG" 2>&1; then
+            DELETED=$(printf '%s' "$DELETED" | jq --arg u "$LU" '. + [$u]')
+            N_DEL=$((N_DEL+1)); log "移除多余用户: $LU"
+        else
+            log "移除失败: $LU（下轮重试）"
+        fi
+    fi
+done < <(printf '%s\n' "$LOCAL_NAMES_BEFORE")
 
 # ---- 回报 ----
 BODY=$(jq -n --argjson a "$APPLIED" --argjson d "$DISABLED" --argjson e "$ERRORS" --argjson x "$DELETED" \
