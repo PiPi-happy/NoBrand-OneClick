@@ -49,6 +49,9 @@ VERSION=$(printf '%s' "$RESP" | jq -r '.data.version // ""')
 LOCAL_JSON="/var/lib/nobrand-oneclick/mieru/users.json"
 [ -r "$LOCAL_JSON" ] || { log "本机 users.json 不存在: $LOCAL_JSON"; exit 1; }
 
+# ---- 合并前的本机用户名快照（移除对照用） ----
+LOCAL_NAMES_BEFORE=$(jq -r '.users[]?.name' "$LOCAL_JSON" 2>/dev/null | sort || true)
+
 # ---- 期望配置表落盘 ----
 TABLE_FILE=$(mktemp /tmp/ena-table.XXXXXX)
 printf '%s' "$RESP" | jq '.data.table' > "$TABLE_FILE" 2>/dev/null
